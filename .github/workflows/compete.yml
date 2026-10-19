@@ -1,0 +1,28 @@
+name: Warwick AI Competition Submission
+on: push
+jobs:
+  compete:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install Dependencies
+        run: pip install -e .
+
+      # poker score writes score.txt, a line for each of score, success_rate, win_rate and details
+      - name: Score WAI Competition Project
+        id: score
+        run: |
+          poker score myAI.py --output score.txt
+          cat score.txt >> "$GITHUB_OUTPUT"
+
+      - name: Generate Summary
+        run: |
+          echo "## WAI Competition: poker" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Score:** ${{ steps.score.outputs.score }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Tests:** ${{ steps.score.outputs.success_rate }}% passed" >> "$GITHUB_STEP_SUMMARY"

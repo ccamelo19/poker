@@ -12,6 +12,7 @@ from ..game_state import GameState
 from .hand import describe, evaluate
 from ..player import Blind, MyPlayer, Player
 from .rules import Rules
+from .sandbox import BotProblem
 
 
 AI = Callable[[GameState], Action]
@@ -388,6 +389,9 @@ class Match:
 
         except TimeLimitExceeded:
             return None, f"took longer than {self.timeout:g}s"
+
+        except BotProblem as e:  # A bot in a container of its own, which went wrong in there
+            return None, str(e)
 
         except Exception as e:
             return None, f"raised {type(e).__name__}: {e}"[:200]

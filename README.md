@@ -150,7 +150,7 @@ Writing `NAME=PATH` chooses the name an AI is shown with. Run `poker run --help`
 poker score
 ```
 
-This scores `myAI.py` the same way as when you push: it checks your AI returns an action on 1000 sample states, then plays it heads-up against a bot which plays at random. The score is printed and written to `score.txt`.
+This runs the same tests as when you push: it checks your AI returns an action, in time, on 1000 sample states. A bot which passes gets 100 points, which are printed and written to `score.txt`. All of your other points come from the weekly tournaments.
 
 #### 📜 Trying different rules
 ```bash
@@ -174,7 +174,7 @@ These are the rules every game is played by, including the weekly competition. A
 
 ### Tables
 
-- A table seats at most 8 players. With more than 8, players are dealt out in turn, in the order they are given, between as few tables as they fit at, so the tables are as even as they can be.
+- A table seats at most 8 players. With more than 8, players are dealt out in turn, in the order they are given, between as few tables as they fit at, so the tables are as even as they can be. In the weekly tournament, the order is drawn at random.
 - The tables play **hand for hand**: no table deals its next hand until every other table has finished the one before. So hand 20 at one table is played alongside hand 20 at every other.
 - Players are only moved between tables once every table has finished a hand.
   - **Breaking a table:** when everyone left would fit at fewer tables, the table with the fewest players is broken up, and its players are sent one at a time to whichever tables have the fewest players.
@@ -212,6 +212,7 @@ After that, the pattern carries on ten times bigger.
 
 - Your AI has **1 second** for each action.
 - If it raises an exception, takes too long, doesn't return an `Action`, or checks when there is a bet to call, it checks if it can and folds if it can't. That is the same as `defaultAI` and `examples/default.py`, and it counts as a bad action.
+- In the weekly tournament, every bot runs on its own, apart from the game, with no internet access, 512 MB of memory and one CPU. It can read the files in its repo but not change them, and what it prints isn't shown. A bot which can't be loaded checks or folds every time.
 
 ### Finishing Places
 
@@ -219,15 +220,22 @@ After that, the pattern carries on ten times bigger.
 - Everyone else finishes in the order they went out, the last to go out finishing highest.
 - Players who go out on the same hand, at any table, are placed by how many chips they had at the start of that hand: more chips finishes higher.
 
-### Scoring
+### Tournament Score
 
-Your score is your **peak chips**, which is the most chips you ever had at the end of a hand, plus **bonus chips** for where you finished: 10 for last, 20 for second to last, and so on up to the winner.
+Your score in a tournament is your **peak chips**, which is the most chips you ever had at the end of a hand, plus **bonus chips** for where you finished: 10 for last, 20 for second to last, and so on up to the winner.
 
 - With 28 players, the winner ends with all 5,600 chips and scores 5,600 + 280 = **5,880**.
 - Someone who never got past their starting stack of 200 scores 200 plus their bonus, so 210 if they came last.
 - A tournament with more players has more chips in play, so it gives bigger scores.
 
 Most of the score is for building a stack. A bot which folds every hand can outlast bots which gamble with each other, but it never wins a pot, so its peak chips stay at about its starting stack and it only gets the bonus for where it finished. The best way to score is to win chips, as in a real game of poker.
+
+### Leaderboard Points
+
+- **100 points** when you push a bot which passes the tests, which check it returns an action, in time, on 1000 sample states.
+- Every weekly tournament then adds your **tournament score** to your total on the leaderboard.
+- Your points add up from week to week, even when you push a new bot.
+- Each week, your latest bot which passes the tests plays. If your newest push fails the tests, your last one which passed plays instead.
 
 ---
 
@@ -269,7 +277,44 @@ To submit your AI, simply push a commit to your repository.
 > [!IMPORTANT]
 > **Your commits should only change `myAI.py`.** Before you push, check that no other file has changed, for example with `git status`. If anything other than `myAI.py` is listed, undo the change with `git restore <file>`, or delete the file if you added it.
 
-Every week at code night, your latest bot will compete against all other submitted bots. Points will be awarded, which you will be able to see on our website! <https://warwick.ai>
+Every week at code night, your latest bot which passes the tests will compete against all other submitted bots. Your points add up from week to week, and you can see them on our website! <https://warwick.ai>
+
+---
+
+## 🗓️ Running the Weekly Tournament
+
+This is for the organisers. Whenever this template changes, bring every team's repo up to date with the website's `db/push-template-updates.ts`, which also scores every bot again. It can't change `.github/workflows`, so check the repos it lists as having an out of date workflow.
+
+Each week:
+
+1. **Download every team's bot.** In the website folder, this picks each team's latest submission which passed the tests:
+   ```bash
+   PROJECT_ID=poker npx astro db execute db/download-snapshots.ts --remote
+   ```
+2. **Move the bots out of the website folder,** to keep them away from its credentials:
+   ```bash
+   mv snapshots/poker ~/poker-round-1
+   ```
+3. **Check the bots and build the sandbox.** In the WarwickAI/competitions folder, with Docker running, this runs every team's tests again in a locked-down container of its own, and builds the `wai-results` image the tournament uses:
+   ```bash
+   STUDENT_FILES="myAI.py" ./results/run.sh ~/poker-round-1 ../poker-comp-update
+   ```
+4. **Play the tournament.** In this folder, with Docker running, first try a few hands, which should say that every bot is ready:
+   ```bash
+   poker run --snapshots ~/poker-round-1 --hands 5
+   ```
+   Then play it, with the round's seed so it can be played again the same way:
+   ```bash
+   poker run --snapshots ~/poker-round-1 --seed 1 --results round-1.json
+   ```
+   Every team's bot runs in a Docker container of its own, with no network and no access to your files, and only the game itself runs on your computer. What each bot prints is kept in `bot-logs`, up to 1 MB each. Never add `--no-sandbox` for the teams' bots, as it runs their code on your computer itself.
+5. **Record the results.** In the website folder, check with a dry run first, then run it again without `DRY_RUN=1`:
+   ```bash
+   PROJECT_ID=poker ROUND=1 RESULTS=../poker-comp-update/round-1.json DRY_RUN=1 \
+     npx astro db execute db/record-tournament.ts --remote
+   ```
+
+The leaderboard adds each team's tournament score to their total. Recording a round again replaces it, so a mistake can be fixed by recording the right results. A tournament which was stopped before it finished is only recorded with `FORCE=1`.
 
 ---
 

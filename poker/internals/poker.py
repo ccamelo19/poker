@@ -1,21 +1,29 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import datetime
 import importlib.util
+import json
 import random
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
 
 from .engine import AI
 from .rules import Rules
-from .score import NUM_MATCHES, NUM_STATES, score as score_ai
+from .sandbox import IMAGE, Sandbox
+from .score import score as score_ai
 from .tournament import TABLE_SIZE, Tournament
 
 
-def load_ais(specs: list[str], least: int = 2) -> list[tuple[str, AI]]:
-    # Each spec is a path to a python file with a myAI function, optionally written as NAME=PATH
+STARTING_PATH = list(sys.path)  # The module search path from before any bot is loaded, for the windows to start with
+
+
+def load_ais(specs: list[str], least: int = 2, taken: list[str] = ()) -> list[tuple[str, AI]]:
+    # Each spec is a path to a python file with a myAI function, optionally written as NAME=PATH. Names in taken are already used.
     ais = []
 
     for index, spec in enumerate(specs):
@@ -40,11 +48,11 @@ def load_ais(specs: list[str], least: int = 2) -> list[tuple[str, AI]]:
         if not callable(getattr(module, "myAI", None)):
             raise SystemExit(f"poker: {path} doesn't have a myAI function")
 
-        taken = [other for other, _ in ais]
+        used = [*taken, *(other for other, _ in ais)]
         base = name
         number = 2
 
-        while name in taken:
+        while name in used:
             name = f"{base} {number}"
             number += 1
 
@@ -54,6 +62,75 @@ def load_ais(specs: list[str], least: int = 2) -> list[tuple[str, AI]]:
         raise SystemExit(f"poker: expected at least {least} AIs, but there were {len(ais)}")
 
     return ais
+
+
+@dataclass
+class Team:
+    # Where a bot came from, so that its result can be recorded against the team's submission on the website
+    repo: str
+    commit: str
+
+
+def load_snapshots(folder: str) -> tuple[list[tuple[str, Path]], dict[str, Team]]:
+    # Reads the folder which the website's db/download-snapshots.ts makes: a manifest.csv, and a folder for each team's repo
+    # at the commit which was picked. Returns each team's name and its myAI.py, and which team each name is.
+    # Nothing is loaded, as their code is only ever run in a container unless --no-sandbox says otherwise.
+    folder = Path(folder)
+    manifest = folder / "manifest.csv"
+
+    if not manifest.is_file():
+        raise SystemExit(f"poker: there is no manifest.csv in {folder}. Make the folder with the website's db/download-snapshots.ts")
+
+    with manifest.open(newline="", encoding="utf-8") as file:
+        rows = list(csv.DictReader(file))
+
+    # Teams are shown by who owns their repo, as many repos keep the template's name
+    owners = [row["repo"].split("/")[0] for row in rows]
+    bots, teams = [], {}
+
+    for row, owner in zip(rows, owners):
+        path = folder / row["folder"] / "myAI.py" if row["folder"] else None
+
+        if path is None or not path.is_file():
+            print(f"poker: skipping {row['repo']}, as there is no myAI.py in its snapshot", file=sys.stderr)
+            continue
+
+        if float(row["score"] or 0) <= 0:
+            print(f"poker: skipping {row['repo']}, as none of its bots has passed the tests", file=sys.stderr)
+            continue
+
+        name = owner if owners.count(owner) == 1 else row["repo"]
+        bots.append((name, path))
+        teams[name] = Team(repo=row["repo"], commit=row["commit"])
+
+    return bots, teams
+
+
+def write_results(path: str, tournament: Tournament, teams: dict[str, Team], seed: int | None):
+    # Writes everyone's result, for the website's db/record-tournament.ts to add to the leaderboard. Players who aren't one
+    # of the teams, such as example bots added to make up the numbers, are listed without a repo and aren't recorded.
+    complete = tournament.is_over()  # False if it was stopped early, such as by closing a window
+
+    results = {
+        "playedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        "seed": seed,
+        "complete": complete,
+        "hands": max(table.hands_played() for table in tournament.tables),
+        "players": [
+            {
+                "name": result.name,
+                "repo": teams[result.name].repo if result.name in teams else None,
+                "commit": teams[result.name].commit if result.name in teams else None,
+                "place": result.place,
+                "peakChips": result.peak,
+                "score": result.score,
+            }
+            for result in tournament.standings()
+        ],
+    }
+
+    Path(path).write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
+    print(f"\nResults written to {path}" + ("" if complete else ", but the tournament was stopped before it finished"))
 
 
 def parse_blinds(text: str) -> tuple[int, int]:
@@ -164,17 +241,52 @@ def ending(tournament: Tournament) -> list[str]:
     return lines
 
 
-def run(args: argparse.Namespace):
-    ais = load_ais(args.ais)
-    rules = load_rules(args)
+def load_players(args: argparse.Namespace, rules: Rules) -> tuple[list[tuple[str, AI]], dict[str, Team], Sandbox | None]:
+    # The teams from --snapshots, each in a container of its own unless --no-sandbox is given, and any other AIs, which are
+    # the organiser's own and run here. Returns the players, which team each is, and the sandbox, to stop when it's over.
+    bots, teams = load_snapshots(args.snapshots) if args.snapshots else ([], {})
+    sandbox = None
 
+    if bots and not args.no_sandbox:
+        sandbox = Sandbox(image=args.image, timeout=rules.timeout, seed=args.seed, logs=Path(args.logs))
+        ais = sandbox.start([(name, path.parent, teams[name].repo) for name, path in bots])
+    else:
+        ais = load_ais([f"{name}={path}" for name, path in bots], least=0)
+
+    ais += load_ais(args.ais, least=0, taken=[name for name, _ in ais])
+
+    if len(ais) < 2:
+        if sandbox:
+            sandbox.stop()
+
+        raise SystemExit(f"poker: expected at least 2 AIs, but there were {len(ais)}")
+
+    if args.snapshots:
+        # Seats are drawn at random, as in a real tournament, and the same seed draws them the same way
+        random.Random(args.seed).shuffle(ais)
+
+    return ais, teams, sandbox
+
+
+def run(args: argparse.Namespace):
+    rules = load_rules(args)
+    ais, teams, sandbox = load_players(args, rules)
+
+    try:
+        watch(args, ais, teams, rules)
+    finally:
+        if sandbox:
+            sandbox.stop()
+
+
+def watch(args: argparse.Namespace, ais: list[tuple[str, AI]], teams: dict[str, Team], rules: Rules):
     from .render import CONTROLS  # Imported here so that poker test works without a screen
     from .window import Windows
 
     print(f"Controls: {CONTROLS}")
     tournament = new_tournament(args, ais, rules)
     title = "MATCH OVER" if len(tournament.tables) == 1 else "TOURNAMENT OVER"
-    windows = Windows(total_hands=rules.hands, fullscreen=args.fullscreen)
+    windows = Windows(total_hands=rules.hands, fullscreen=args.fullscreen, sys_path=STARTING_PATH)
     told: dict[int, str] = {}  # What each window has been told about how its table ended
 
     def tell_windows():
@@ -267,10 +379,22 @@ def run(args: argparse.Namespace):
 
     print_standings(tournament)
 
+    if args.results:
+        write_results(args.results, tournament, teams, args.seed)
+
 
 def test(args: argparse.Namespace):
-    ais = load_ais(args.ais)
     rules = load_rules(args)
+    ais, _, sandbox = load_players(args, rules)
+
+    try:
+        play_matches(args, ais, rules)
+    finally:
+        if sandbox:
+            sandbox.stop()
+
+
+def play_matches(args: argparse.Namespace, ais: list[tuple[str, AI]], rules: Rules):
     rng = random.Random(args.seed)
 
     chips = {name: 0 for name, _ in ais}
@@ -309,9 +433,8 @@ def test(args: argparse.Namespace):
 
 
 def score(args: argparse.Namespace):
-    (name, ai), = load_ais([args.ai], least=1)
-    rules = load_rules(args)
-    score_ai(name, ai, rules=rules, output=Path(args.output), states=args.states, matches=args.matches)
+    (_, ai), = load_ais([args.ai], least=1)
+    score_ai(ai, args.output)
 
 
 def main(argv: list[str] | None = None):
@@ -322,7 +445,7 @@ def main(argv: list[str] | None = None):
     options.add_argument("--blinds", type=parse_blinds, metavar="SMALL/BIG", help="the blinds at the start, like 10/20, in place of what the rules say")
     options.add_argument("--timeout", type=float, metavar="SECONDS", help="how long an AI gets for each action, or 0 for no limit, in place of what the rules say")
 
-    seeded = argparse.ArgumentParser(add_help=False, parents=[options])  # poker score always uses the same cards, so it has no --seed
+    seeded = argparse.ArgumentParser(add_help=False, parents=[options])
     seeded.add_argument("--seed", type=int, help="makes the cards the same every time")
 
     ais_help = f"path to a python file with a myAI function, or NAME=PATH to choose the name it is shown with (at least 2, and more than {TABLE_SIZE} are split between tables)"
@@ -330,21 +453,26 @@ def main(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(prog="poker", description="Play poker AIs against each other.")
     commands = parser.add_subparsers(dest="command", required=True)
 
-    run_parser = commands.add_parser("run", parents=[seeded], help="play a match and watch it, with a window for each table")
-    run_parser.add_argument("ais", nargs="+", metavar="AI", help=ais_help)
+    snapshots = argparse.ArgumentParser(add_help=False)
+    snapshots.add_argument("--snapshots", metavar="FOLDER", help="also play every team's bot from a folder made by the website's db/download-snapshots.ts, each in a Docker container of its own")
+    snapshots.add_argument("--image", default=IMAGE, help=f"the Docker image to run the teams' bots in ({IMAGE}, which the competitions repo's results/run.sh builds, if left out)")
+    snapshots.add_argument("--logs", default="bot-logs", metavar="FOLDER", help="where to keep what each team's bot prints (bot-logs if left out)")
+    snapshots.add_argument("--no-sandbox", action="store_true", help="run the teams' bots here instead of in containers. Their code can then do anything you can, so only use this for bots you trust")
+
+    run_parser = commands.add_parser("run", parents=[seeded, snapshots], help="play a match and watch it, with a window for each table")
+    run_parser.add_argument("ais", nargs="*", metavar="AI", help=ais_help)
+    run_parser.add_argument("--results", metavar="FILE", help="write everyone's result to this file, for the website's db/record-tournament.ts")
     run_parser.add_argument("--fullscreen", action="store_true", help="start with the window filling the screen")
     run_parser.set_defaults(function=run)
 
-    test_parser = commands.add_parser("test", parents=[seeded], help="play many matches without watching and print the results")
+    test_parser = commands.add_parser("test", parents=[seeded, snapshots], help="play many matches without watching and print the results")
     test_parser.add_argument("matches", type=positive, help="how many matches to play")
-    test_parser.add_argument("ais", nargs="+", metavar="AI", help=ais_help)
+    test_parser.add_argument("ais", nargs="*", metavar="AI", help=ais_help)
     test_parser.set_defaults(function=test)
 
-    score_parser = commands.add_parser("score", parents=[options], help="score an AI as the competition does when you push, and write the score to a file")
+    score_parser = commands.add_parser("score", help="score an AI as the competition does when you push, and write the score to a file")
     score_parser.add_argument("ai", nargs="?", default="myAI.py", metavar="AI", help="path to a python file with a myAI function (myAI.py if left out)")
     score_parser.add_argument("--output", default="score.txt", metavar="FILE", help="where to write the score (score.txt if left out)")
-    score_parser.add_argument("--states", type=whole, default=NUM_STATES, help=f"how many sample states to check the AI returns an Action on ({NUM_STATES} if left out)")
-    score_parser.add_argument("--matches", type=whole, default=NUM_MATCHES, help=f"how many heads-up matches to play against a random bot ({NUM_MATCHES} if left out)")
     score_parser.set_defaults(function=score)
 
     args = parser.parse_args(argv)

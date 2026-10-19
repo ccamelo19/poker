@@ -41,6 +41,7 @@ class Exit:
     table: int
     hand: int
     started_with: int  # Chips at the start of the hand they went out on, which decides between players who went out on the same hand
+    position: int  # Their seat at the table, which decides between those who also started it with the same chips
 
 
 class Table:
@@ -157,16 +158,18 @@ class Tournament:
 
     def record_exits(self, table: Table, hand: dict):
         # Called straight after the hand, so the seats are still in the order the hand was played in
-        for seat, started_with in zip(table.match.seats, hand["frames"][0]["stacks"]):
+        for position, (seat, started_with) in enumerate(zip(table.match.seats, hand["frames"][0]["stacks"])):
             if seat.stack == 0 and seat not in self.recorded:
                 self.recorded.add(seat)
-                self.exits.append(Exit(seat=seat, table=table.number, hand=hand["number"], started_with=started_with))
+                self.exits.append(Exit(seat=seat, table=table.number, hand=hand["number"], started_with=started_with, position=position))
 
     def standings(self) -> list[Result]:
         # Players still in come first, most chips first. Then everyone who went out, the last to go out first. Of players who went
         # out on the same hand, at any table, whoever started that hand with more chips finishes higher, as is usual in a tournament.
         still_in = sorted(self.players(), key=lambda seat: seat.stack, reverse=True)
-        gone = sorted(self.exits, key=lambda exit: (exit.hand, exit.started_with), reverse=True)
+        # Any exact tie goes to the lower numbered table, then the earlier seat, so the places never depend on which table happened
+        # to play the hand first
+        gone = sorted(self.exits, key=lambda exit: (exit.hand, exit.started_with, -exit.table, -exit.position), reverse=True)
         results = [Result(place=0, name=seat.name, stack=seat.stack, errors=seat.errors, peak=seat.peak) for seat in still_in]
         results += [Result(place=0, name=exit.seat.name, stack=0, errors=exit.seat.errors, table=exit.table, hand=exit.hand, peak=exit.seat.peak) for exit in gone]
 

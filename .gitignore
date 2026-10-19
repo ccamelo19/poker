@@ -218,3 +218,6 @@ __marimo__/
 .streamlit/secrets.toml
 # Written by poker score
 score.txt
+
+# What the bots print during a tournament
+bot-logs/

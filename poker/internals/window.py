@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import multiprocessing
 import queue
+import sys
 
 
 # raylib can only open one window in a process, so every table is shown by a process of its own. The AIs and the
@@ -79,7 +80,10 @@ def run_window(number: int, count: int, players: list[str], total_hands: int, fu
 
 class Windows:
     # The windows of every table, from the main process's side
-    def __init__(self, *, total_hands: int, fullscreen: bool):
+    def __init__(self, *, total_hands: int, fullscreen: bool, sys_path: list[str] | None = None):
+        # A window process is started with sys_path as its module search path. The bots' folders are added to it as they are
+        # loaded, and a team's snapshot holds its own copy of the poker folder, which a window must never import in place of this one.
+        self.sys_path = list(sys_path) if sys_path is not None else list(sys.path)
         self.context = multiprocessing.get_context("spawn")  # The same on every system, and nothing from the main process is copied into a window
         self.events = self.context.Queue()
         self.total_hands = total_hands
@@ -111,7 +115,13 @@ class Windows:
 
         self.commands[number] = self.context.Queue()
         process = self.context.Process(target=show_table, args=(number, self.count, players, self.total_hands, self.fullscreen, self.generation, self.commands[number], self.events), daemon=True)
-        process.start()
+        searched = sys.path[:]
+        sys.path[:] = self.sys_path  # A spawned process is given the search path in place when it starts
+
+        try:
+            process.start()
+        finally:
+            sys.path[:] = searched
         self.processes[number] = process
         self.open.add(number)
 
